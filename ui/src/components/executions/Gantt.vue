@@ -4,6 +4,11 @@
         :execution="execution!"
     />
     <template v-else-if="execution && executionsStore.flow">
+        <ExecutionProgress
+            v-if="isRunning"
+            :execution="execution!"
+            class="mb-3"
+        />
         <KSFilter
             :configuration="ganttExecutionFilter"
             :tableOptions="{
@@ -137,6 +142,7 @@
     import ChevronDown from "vue-material-design-icons/ChevronDown.vue";
     import Warning from "vue-material-design-icons/Alert.vue";
     import ExecutionPending from "./ExecutionPending.vue";
+    import ExecutionProgress from "./ExecutionProgress.vue";
     import KSFilter from "../filter/components/KSFilter.vue";
     import {Comparators, type AppliedFilter} from "../filter/utils/filterTypes";
     import {useGanttExecutionFilter} from "../filter/configurations";
@@ -368,6 +374,10 @@
 
     const isExecutionStarted = computed<boolean>(() => {
         return !!execution.value?.state?.current && !["CREATED", "QUEUED"].includes(execution.value.state.current);
+    });
+
+    const isRunning = computed<boolean>(() => {
+        return !!execution.value && State.isRunning(execution.value.state.current);
     });
 
     const hasValidDate = computed<boolean>(() => isFinite(delta()));

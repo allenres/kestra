@@ -735,6 +735,12 @@ export const useExecutionsStore = defineStore("executions", () => {
         });
     }
 
+    const loadFlowAvgDuration = (namespace: string, flowId: string, executionId?: string): Promise<{avgDurationMs: number | null; count: number}> => {
+        return axios.get(`${apiUrl()}/executions/namespaces/${namespace}/flows/${flowId}/average-duration`, {
+            params: executionId ? {executionId} : undefined
+        }).then(r => r.data);
+    }
+
     const exportExecutionsAsCSV = async (params: any) => {
         const response = await axios.get(
             `${apiUrl()}/executions/export/by-query/csv`,
@@ -811,6 +817,7 @@ export const useExecutionsStore = defineStore("executions", () => {
         forceRun,
         bulkForceRunExecution,
         queryForceRunExecution,
+        loadFlowAvgDuration,
         loadFlowForExecution,
         loadFlowForExecutionByExecutionId,
         loadGraph,
