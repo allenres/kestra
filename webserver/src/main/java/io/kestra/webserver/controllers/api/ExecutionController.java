@@ -37,6 +37,7 @@ import io.kestra.core.utils.Await;
 import io.kestra.core.utils.IdUtils;
 import io.kestra.core.utils.ListUtils;
 import io.kestra.core.utils.Logs;
+import io.kestra.plugin.core.flow.ForEach;
 import io.kestra.plugin.core.flow.Pause;
 import io.kestra.plugin.core.trigger.AbstractWebhookTrigger;
 import io.kestra.plugin.core.trigger.WebhookContext;
@@ -2447,6 +2448,176 @@ public class ExecutionController {
     ) {
         return flowRepository.findByNamespaceExecutable(tenantService.resolveTenant(), namespace);
     }
+
+    @ExecuteOn(TaskExecutors.IO)
+    @Get(uri = "/namespaces/{namespace}/flows/{flowId}/average-duration")
+    @Operation(tags = {"Executions"}, summary = "Get the average duration of recent successful executions for a flow, used to estimate execution progress. When executionId is provided, adjusts the estimate for ForEach tasks based on the current execution's iteration count.")
+    public FlowAverageDuration getFlowAverageDuration(
+        @Parameter(description = "The flow namespace") @PathVariable String namespace,
+        @Parameter(description = "The flow id") @PathVariable String flowId,
+        @Parameter(description = "Optional running execution id to enable ForEach-aware duration estimation") @Nullable @QueryValue String executionId
+    ) {
+        var recentExecutions = executionRepository.findByFlowId(
+            tenantService.resolveTenant(),
+            namespace,
+            flowId,
+            PageableUtils.from(1, 50)
+        );
+
+        List<Execution> successful = recentExecutions.stream()
+            .filter(e -> e.getState().getCurrent() == State.Type.SUCCESS || e.getState().getCurrent() == State.Type.WARNING)
+            .filter(e -> e.getState().getDuration().isPresent())
+            .collect(Collectors.toList());
+
+        if (successful.isEmpty()) {
+            return new FlowAverageDuration(null, 0L);
+        }
+
+        // Try ForEach-aware estimation when an executionId is provided
+        if (executionId != null && !executionId.isBlank()) {
+            Optional<Flow> flowOpt = flowRepository.findById(tenantService.resolveTenant(), namespace, flowId);
+            if (flowOpt.isPresent()) {
+                List<ForEach> foreachTasks = flowOpt.get().allTasksWithChilds().stream()
+                    .filter(t -> t instanceof ForEach)
+                    .map(t -> (ForEach) t)
+                    .toList();
+
+                if (!foreachTasks.isEmpty()) {
+                    Optional<Execution> currentOpt = executionRepository.findById(tenantService.resolveTenant(), executionId);
+                    if (currentOpt.isPresent()) {
+                        Long adjusted = computeForEachAwareDuration(foreachTasks, successful, currentOpt.get());
+                        if (adjusted != null) {
+                            return new FlowAverageDuration(adjusted, (long) successful.size());
+                        }
+                    }
+                }
+            }
+        }
+
+        long avgMs = (long) successful.stream()
+            .mapToLong(e -> e.getState().getDuration().get().toMillis())
+            .average()
+            .orElse(0);
+        return new FlowAverageDuration(avgMs, (long) successful.size());
+    }
+
+    /**
+     * Computes a ForEach-aware estimated total duration for the current execution.
+     * For each ForEach task in the flow, it:
+     * 1. Derives the average time per effective batch from historical executions.
+     * 2. Counts the number of iterations visible in the current execution to estimate N.
+     * 3. Scales based on ceil(N / concurrencyLimit).
+     * Returns null if estimation is not possible (e.g. no historical ForEach data).
+     */
+    private Long computeForEachAwareDuration(
+        List<ForEach> foreachTasks,
+        List<Execution> historical,
+        Execution current
+    ) {
+        if (current.getTaskRunList() == null || current.getTaskRunList().isEmpty()) {
+            return null;
+        }
+
+        long totalAdjustedForeachMs = 0;
+        long totalHistoricalNonForeachMs = 0;
+        int processedCount = 0;
+
+        for (ForEach foreach : foreachTasks) {
+            String taskId = foreach.getId();
+            int concurrencyLimit = foreach.getConcurrencyLimit();
+
+            // Locate the ForEach container TaskRun in the current execution
+            Optional<TaskRun> currentForeachRunOpt = current.getTaskRunList().stream()
+                .filter(tr -> tr.getTaskId().equals(taskId))
+                .findFirst();
+            if (currentForeachRunOpt.isEmpty()) continue;
+
+            TaskRun currentForeachRun = currentForeachRunOpt.get();
+            String currentForeachRunId = currentForeachRun.getId();
+
+            // Count distinct iteration values among direct children (each child = one iteration root)
+            long nCurrVisible = current.getTaskRunList().stream()
+                .filter(tr -> currentForeachRunId.equals(tr.getParentTaskRunId()) && tr.getValue() != null)
+                .map(TaskRun::getValue)
+                .distinct()
+                .count();
+
+            // Gather per-batch timing and N from historical completed executions
+            List<Long> iterDurationsMs = new ArrayList<>();
+            List<Long> nonForeachDurationsMs = new ArrayList<>();
+            List<Long> historicalNs = new ArrayList<>();
+
+            for (Execution hist : historical) {
+                if (hist.getTaskRunList() == null) continue;
+
+                Optional<TaskRun> histForeachRunOpt = hist.getTaskRunList().stream()
+                    .filter(tr -> tr.getTaskId().equals(taskId))
+                    .findFirst();
+                if (histForeachRunOpt.isEmpty()) continue;
+
+                TaskRun histForeachRun = histForeachRunOpt.get();
+                Optional<Duration> foreachDurOpt = histForeachRun.getState().getDuration();
+                if (foreachDurOpt.isEmpty()) continue;
+
+                long foreachMs = foreachDurOpt.get().toMillis();
+
+                long nHist = hist.getTaskRunList().stream()
+                    .filter(tr -> histForeachRun.getId().equals(tr.getParentTaskRunId()) && tr.getValue() != null)
+                    .map(TaskRun::getValue)
+                    .distinct()
+                    .count();
+                if (nHist == 0) continue;
+
+                long effectiveBatchesHist = foreachEffectiveBatches(nHist, concurrencyLimit);
+                iterDurationsMs.add(foreachMs / effectiveBatchesHist);
+                historicalNs.add(nHist);
+
+                hist.getState().getDuration().ifPresent(totalDur ->
+                    nonForeachDurationsMs.add(Math.max(0, totalDur.toMillis() - foreachMs))
+                );
+            }
+
+            if (iterDurationsMs.isEmpty()) continue;
+
+            long avgIterDurationMs = (long) iterDurationsMs.stream()
+                .mapToLong(Long::longValue).average().orElse(0);
+
+            // For unlimited parallelism (C=0) or a completed ForEach, all iterations are visible.
+            // For sequential/limited concurrency during execution, fall back to historical avg N.
+            long nCurr;
+            boolean foreachDone = currentForeachRun.getState().isTerminated();
+            if (foreachDone || concurrencyLimit == 0) {
+                nCurr = Math.max(1, nCurrVisible);
+            } else {
+                long histAvgN = (long) historicalNs.stream().mapToLong(Long::longValue).average().orElse(nCurrVisible);
+                nCurr = Math.max(nCurrVisible, histAvgN);
+            }
+
+            long effectiveBatchesCurr = foreachEffectiveBatches(nCurr, concurrencyLimit);
+            totalAdjustedForeachMs += avgIterDurationMs * effectiveBatchesCurr;
+
+            if (!nonForeachDurationsMs.isEmpty()) {
+                totalHistoricalNonForeachMs += (long) nonForeachDurationsMs.stream()
+                    .mapToLong(Long::longValue).average().orElse(0);
+            }
+            processedCount++;
+        }
+
+        if (processedCount == 0) return null;
+        return totalHistoricalNonForeachMs + totalAdjustedForeachMs;
+    }
+
+    @VisibleForTesting
+    static long foreachEffectiveBatches(long n, int concurrencyLimit) {
+        if (concurrencyLimit == 0 || n <= concurrencyLimit) return 1;
+        return (long) Math.ceil((double) n / concurrencyLimit);
+    }
+
+    @Introspected
+    public record FlowAverageDuration(
+        @io.micronaut.core.annotation.Nullable Long avgDurationMs,
+        long count
+    ) {}
 
     @ExecuteOn(TaskExecutors.IO)
     @Get(uri = "/{executionId}/follow-dependencies", produces = MediaType.TEXT_EVENT_STREAM)
